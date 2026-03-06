@@ -44,6 +44,17 @@ $CsvRows = [System.Collections.Generic.List[PSCustomObject]]::new()
 $Profiles = Get-ChildItem -Path $UsersRoot -Directory -ErrorAction SilentlyContinue
 $RestrictedProfiles = [System.Collections.Generic.List[string]]::new()
 
+# Pre-compute current user SID for ACL checks (once, not per-profile).
+# Only check the user's personal SID — not group memberships like
+# BUILTIN\Administrators — so we detect profiles where the user lacks
+# an explicit personal FullControl ACE (important for non-elevated access).
+$CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$CurrentPrincipal = New-Object System.Security.Principal.WindowsPrincipal($CurrentIdentity)
+$IsElevated = $CurrentPrincipal.IsInRole(
+    [System.Security.Principal.WindowsBuiltInRole]::Administrator)
+$AdminSid = 'S-1-5-32-544'
+$CurrentUserSid = $CurrentIdentity.User.Value
+
 foreach ($Profile in $Profiles) {
     $ProfileName = $Profile.Name
     $Videos      = [System.Collections.Generic.List[string]]::new()
@@ -76,15 +87,13 @@ foreach ($Profile in $Profiles) {
     $HasFullAccess = $false
     try {
         $Acl = Get-Acl -Path $Profile.FullName -ErrorAction Stop
-        $CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-        $UserSids = @($CurrentIdentity.User.Value) + @($CurrentIdentity.Groups | ForEach-Object { $_.Value })
         foreach ($Rule in $Acl.Access) {
             if ($Rule.AccessControlType -eq 'Allow' -and
                 $Rule.FileSystemRights.HasFlag([System.Security.AccessControl.FileSystemRights]::FullControl)) {
                 try {
                     $RuleSid = $Rule.IdentityReference.Translate(
                         [System.Security.Principal.SecurityIdentifier]).Value
-                    if ($UserSids -contains $RuleSid) {
+                    if ($RuleSid -eq $CurrentUserSid) {
                         $HasFullAccess = $true
                         break
                     }
@@ -158,14 +167,7 @@ if ($RestrictedProfiles.Count -gt 0) {
     }
     Write-Host ''
 
-    # Determine admin membership and elevation status
-    $Principal = New-Object System.Security.Principal.WindowsPrincipal(
-        [System.Security.Principal.WindowsIdentity]::GetCurrent())
-    $IsElevated = $Principal.IsInRole(
-        [System.Security.Principal.WindowsBuiltInRole]::Administrator)
-
     # Check admin group membership via whoami (visible even in non-elevated sessions)
-    $AdminSid  = 'S-1-5-32-544'
     $IsAdmin   = $false
     try {
         $GroupsCsv = whoami /groups /fo csv 2>$null | ConvertFrom-Csv
