@@ -180,49 +180,97 @@ if ($RestrictedProfiles.Count -gt 0) {
         Write-Host 'Cannot grant access: this process is not running with elevated (Administrator) privileges.'
         Write-Host 'Re-run this script from an elevated PowerShell prompt to grant access.'
     } else {
-        foreach ($P in $RestrictedProfiles) {
-            $Answer = Read-Host "Grant full access to '$P'? (y/n)"
-            if ($Answer -eq 'y') {
-                Write-Host "  Granting full access to $P ..."
+        $Total = $RestrictedProfiles.Count
+        $Answer = Read-Host "Grant full access to all $Total profile directories? (y/n)"
+
+        if ($Answer -ne 'y') {
+            Write-Host 'Skipped - no permissions were changed.'
+        } else {
+            # Profiles icacls could not touch at all, and profiles it granted
+            # except for a few protected items (Norton and friends).
+            $GrantFailures = [System.Collections.Generic.List[PSCustomObject]]::new()
+            $PartialGrants = [System.Collections.Generic.List[PSCustomObject]]::new()
+            $Index = 0
+
+            foreach ($P in $RestrictedProfiles) {
+                $Index++
+                Write-Progress -Activity 'Granting full access' `
+                    -Status "$Index of $Total : $P" `
+                    -PercentComplete ([int](100 * $Index / $Total))
 
                 # /C  : keep going when an individual file/dir is denied
                 #       (e.g. Norton and other tamper-protected directories)
                 # /Q  : suppress per-file success messages
                 # *SID: grant by SID so local/domain name resolution can't fail
-                $IcaclsOut = & icacls $P /grant "*${CurrentUserSid}:(OI)(CI)F" /T /C /Q 2>&1
+                $IcaclsOut  = & icacls $P /grant "*${CurrentUserSid}:(OI)(CI)F" /T /C /Q 2>&1
                 $IcaclsExit = $LASTEXITCODE
 
                 $OutText = ($IcaclsOut | ForEach-Object { $_.ToString() }) -join "`n"
-                $Failed = 0
-                $SawSummary = $false
-                $Summary = [regex]::Match($OutText, 'Failed processing (\d+) file')
-                if ($Summary.Success) {
-                    $SawSummary = $true
-                    $Failed = [int]$Summary.Groups[1].Value
-                }
 
-                $FailedPaths = @(
+                # icacls reports its own tally; trust it over the exit code, which
+                # is non-zero even when only one item out of hundreds was denied.
+                $Succeeded  = -1
+                $Failed     = -1
+                $OkMatch    = [regex]::Match($OutText, 'Successfully processed (\d+) file')
+                $FailMatch  = [regex]::Match($OutText, 'Failed processing (\d+) file')
+                if ($OkMatch.Success)   { $Succeeded = [int]$OkMatch.Groups[1].Value }
+                if ($FailMatch.Success) { $Failed    = [int]$FailMatch.Groups[1].Value }
+
+                $FailedItems = @(
                     $IcaclsOut |
                         Where-Object { $_ -match ': Access is denied\.$|: The system cannot find' } |
                         ForEach-Object { $_.ToString() }
                 )
 
-                if ($Failed -eq 0 -and $FailedPaths.Count -eq 0) {
-                    if ($IcaclsExit -eq 0 -or $SawSummary) {
-                        Write-Host "  Access granted."
-                    } else {
-                        Write-Host "  Failed to grant access (icacls exit code $IcaclsExit)."
-                        $IcaclsOut | ForEach-Object { Write-Host "    $_" }
+                if ($Succeeded -lt 0) {
+                    # No summary line at all - icacls never got started on this tree.
+                    if ($IcaclsExit -ne 0) {
+                        $GrantFailures.Add([PSCustomObject]@{
+                            Path   = $P
+                            Reason = "icacls exit code $IcaclsExit"
+                            Detail = $OutText
+                        })
                     }
-                } else {
-                    # Partial success: the profile tree was updated except for a
-                    # handful of protected items. Not a failure worth aborting on.
-                    $Count = [Math]::Max($Failed, $FailedPaths.Count)
-                    Write-Host "  Access granted, except for $Count protected item(s):"
-                    foreach ($F in $FailedPaths) { Write-Host "    $F" }
+                } elseif ($Succeeded -eq 0 -and ($Failed -gt 0 -or $FailedItems.Count -gt 0)) {
+                    # Nothing in the tree was updated.
+                    $GrantFailures.Add([PSCustomObject]@{
+                        Path   = $P
+                        Reason = "no items updated (icacls exit code $IcaclsExit)"
+                        Detail = $OutText
+                    })
+                } elseif ($Failed -gt 0 -or $FailedItems.Count -gt 0) {
+                    $PartialGrants.Add([PSCustomObject]@{
+                        Path  = $P
+                        Count = [Math]::Max($Failed, $FailedItems.Count)
+                        Items = $FailedItems
+                    })
                 }
-            } else {
-                Write-Host "  Skipped."
+            }
+
+            Write-Progress -Activity 'Granting full access' -Completed
+
+            $FullyGranted = $Total - $GrantFailures.Count - $PartialGrants.Count
+            Write-Host ''
+            Write-Host "Granted full access to $FullyGranted of $Total profile directories."
+
+            if ($PartialGrants.Count -gt 0) {
+                Write-Host ''
+                Write-Host "$($PartialGrants.Count) profile(s) granted except for protected items:"
+                foreach ($G in $PartialGrants) {
+                    Write-Host "  $($G.Path) - $($G.Count) item(s) skipped"
+                    foreach ($I in $G.Items) { Write-Host "      $I" }
+                }
+            }
+
+            if ($GrantFailures.Count -gt 0) {
+                Write-Host ''
+                Write-Host "$($GrantFailures.Count) profile(s) FAILED to fix:"
+                foreach ($F in $GrantFailures) {
+                    Write-Host "  $($F.Path) - $($F.Reason)"
+                    foreach ($L in ($F.Detail -split "`n")) {
+                        if ($L.Trim()) { Write-Host "      $($L.Trim())" }
+                    }
+                }
             }
         }
     }
