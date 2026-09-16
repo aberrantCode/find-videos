@@ -184,11 +184,42 @@ if ($RestrictedProfiles.Count -gt 0) {
             $Answer = Read-Host "Grant full access to '$P'? (y/n)"
             if ($Answer -eq 'y') {
                 Write-Host "  Granting full access to $P ..."
-                & icacls $P /grant "${env:USERNAME}:(OI)(CI)F" /T /Q
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "  Access granted."
+
+                # /C  : keep going when an individual file/dir is denied
+                #       (e.g. Norton and other tamper-protected directories)
+                # /Q  : suppress per-file success messages
+                # *SID: grant by SID so local/domain name resolution can't fail
+                $IcaclsOut = & icacls $P /grant "*${CurrentUserSid}:(OI)(CI)F" /T /C /Q 2>&1
+                $IcaclsExit = $LASTEXITCODE
+
+                $OutText = ($IcaclsOut | ForEach-Object { $_.ToString() }) -join "`n"
+                $Failed = 0
+                $SawSummary = $false
+                $Summary = [regex]::Match($OutText, 'Failed processing (\d+) file')
+                if ($Summary.Success) {
+                    $SawSummary = $true
+                    $Failed = [int]$Summary.Groups[1].Value
+                }
+
+                $FailedPaths = @(
+                    $IcaclsOut |
+                        Where-Object { $_ -match ': Access is denied\.$|: The system cannot find' } |
+                        ForEach-Object { $_.ToString() }
+                )
+
+                if ($Failed -eq 0 -and $FailedPaths.Count -eq 0) {
+                    if ($IcaclsExit -eq 0 -or $SawSummary) {
+                        Write-Host "  Access granted."
+                    } else {
+                        Write-Host "  Failed to grant access (icacls exit code $IcaclsExit)."
+                        $IcaclsOut | ForEach-Object { Write-Host "    $_" }
+                    }
                 } else {
-                    Write-Host "  Failed to grant access (icacls exit code $LASTEXITCODE)."
+                    # Partial success: the profile tree was updated except for a
+                    # handful of protected items. Not a failure worth aborting on.
+                    $Count = [Math]::Max($Failed, $FailedPaths.Count)
+                    Write-Host "  Access granted, except for $Count protected item(s):"
+                    foreach ($F in $FailedPaths) { Write-Host "    $F" }
                 }
             } else {
                 Write-Host "  Skipped."
