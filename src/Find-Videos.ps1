@@ -5,12 +5,41 @@
 .DESCRIPTION
     Scans specified subdirectories of each profile under C:\Users for .mp4 files.
     Outputs a VLC XSPF playlist per user to .\data\ and a combined CSV.
+
+    By default, known application assets (bundled demo clips, browser-extension
+    stubs, cached UI videos) are excluded so the results contain only real user
+    recordings. Use -IncludeAppAssets to keep everything, or -ExcludePaths to
+    supply your own list of path fragments.
+.PARAMETER UsersRoot
+    Root directory containing user profiles. Defaults to C:\Users.
+.PARAMETER DataDir
+    Output directory for playlists and CSV.
+.PARAMETER ExcludePaths
+    Literal path fragments matched (case-insensitively) against each full file
+    path. A file containing any fragment is excluded. Defaults to known
+    app-asset locations.
+.PARAMETER IncludeAppAssets
+    Disable filtering entirely and report every MP4 found.
 #>
 
 [CmdletBinding()]
 param(
     [string]$UsersRoot = 'C:\Users',
-    [string]$DataDir   = (Join-Path (Split-Path $PSScriptRoot -Parent) 'data')
+    [string]$DataDir   = (Join-Path (Split-Path $PSScriptRoot -Parent) 'data'),
+
+    # Known application-asset locations — none of these hold user recordings.
+    # Union of the exclusions from both branches; the three dev entries are kept
+    # verbatim, and \web-accessible-resources\ additionally catches extension
+    # stubs under non-Default Chrome profiles (e.g. "Profile 1").
+    [string[]]$ExcludePaths = @(
+        '\AppData\Roaming\ManyCam\Backgrounds\',                       # ManyCam bundled demo backgrounds
+        '\AppData\Roaming\Zoom\data\WaitingRoom\',                     # Zoom waiting-room clips
+        '\AppData\Local\Google\Chrome\User Data\Default\Extensions\',  # Chrome extension media
+        '\web-accessible-resources\',                                  # extension resources (noopmp4 stubs)
+        '\AppData\Local\Microsoft\Office\SolutionPackages\'             # Office offline package resources
+    ),
+
+    [switch]$IncludeAppAssets
 )
 
 $SubDirs = @(
@@ -22,11 +51,7 @@ $SubDirs = @(
     'Desktop'
 )
 
-$IgnoreDirs = @(
-    'AppData\Roaming\Zoom\data\WaitingRoom',
-    'AppData\Roaming\ManyCam\Backgrounds',
-    'AppData\Local\Google\Chrome\User Data\Default\Extensions'
-)
+$ActiveExclusions = if ($IncludeAppAssets) { @() } else { $ExcludePaths }
 
 # ---------------------------------------------------------------------------
 # Setup output directory
@@ -35,8 +60,9 @@ if (-not (Test-Path $DataDir)) {
     New-Item -ItemType Directory -Path $DataDir | Out-Null
 }
 
-$CsvPath = Join-Path $DataDir 'all-videos.csv'
-$CsvRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+$CsvPath       = Join-Path $DataDir 'all-videos.csv'
+$CsvRows       = [System.Collections.Generic.List[PSCustomObject]]::new()
+$ExcludedTotal = 0
 
 # ---------------------------------------------------------------------------
 # Iterate profiles
@@ -55,15 +81,15 @@ $IsElevated = $CurrentPrincipal.IsInRole(
 $AdminSid = 'S-1-5-32-544'
 $CurrentUserSid = $CurrentIdentity.User.Value
 
-foreach ($Profile in $Profiles) {
-    $ProfileName = $Profile.Name
+foreach ($UserProfile in $Profiles) {
+    $ProfileName = $UserProfile.Name
     $Videos      = [System.Collections.Generic.List[string]]::new()
 
     # Track per-subdir counts for console output
     $SubDirCounts = [ordered]@{}
 
     foreach ($Sub in $SubDirs) {
-        $SearchPath = Join-Path $Profile.FullName $Sub
+        $SearchPath = Join-Path $UserProfile.FullName $Sub
 
         if (-not (Test-Path $SearchPath)) { continue }
 
@@ -71,22 +97,30 @@ foreach ($Profile in $Profiles) {
                                -ErrorAction SilentlyContinue -Force |
                  Select-Object -ExpandProperty FullName
 
-        if ($Found) {
-            $Found = @($Found) | Where-Object {
-                $Path = $_
-                -not ($IgnoreDirs | Where-Object { $Path -like "*\$_\*" -or $Path -like "*\$_" })
+        if (-not $Found) { continue }
+
+        # Drop known application assets
+        $Kept = foreach ($F in $Found) {
+            $IsAsset = $false
+            foreach ($Fragment in $ActiveExclusions) {
+                if ($F.IndexOf($Fragment, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $IsAsset = $true
+                    break
+                }
             }
-            if ($Found) {
-                $SubDirCounts[$Sub] = @($Found).Count
-                foreach ($F in $Found) { $Videos.Add($F) }
-            }
+            if ($IsAsset) { $ExcludedTotal++ } else { $F }
+        }
+
+        if ($Kept) {
+            $SubDirCounts[$Sub] = @($Kept).Count
+            foreach ($K in $Kept) { $Videos.Add($K) }
         }
     }
 
     # Check if current user has full access to this profile directory
     $HasFullAccess = $false
     try {
-        $Acl = Get-Acl -Path $Profile.FullName -ErrorAction Stop
+        $Acl = Get-Acl -Path $UserProfile.FullName -ErrorAction Stop
         foreach ($Rule in $Acl.Access) {
             if ($Rule.AccessControlType -eq 'Allow' -and
                 $Rule.FileSystemRights.HasFlag([System.Security.AccessControl.FileSystemRights]::FullControl)) {
@@ -104,7 +138,7 @@ foreach ($Profile in $Profiles) {
         # Cannot read ACL — no access
     }
     if (-not $HasFullAccess) {
-        $RestrictedProfiles.Add($Profile.FullName)
+        $RestrictedProfiles.Add($UserProfile.FullName)
     }
 
     if ($Videos.Count -eq 0) { continue }
@@ -154,6 +188,10 @@ if ($CsvRows.Count -gt 0) {
     Write-Host "CSV written: $CsvPath ($($CsvRows.Count) total videos)"
 } else {
     Write-Host 'No MP4 files found across any profile.'
+}
+
+if ($ExcludedTotal -gt 0) {
+    Write-Host "Excluded $ExcludedTotal application asset file$(if ($ExcludedTotal -ne 1) { 's' }) (use -IncludeAppAssets to keep them)."
 }
 
 # ---------------------------------------------------------------------------

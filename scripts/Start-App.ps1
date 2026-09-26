@@ -14,7 +14,9 @@
 [CmdletBinding()]
 param(
     [string]$UsersRoot = 'C:\Users',
-    [string]$DataDir
+    [string]$DataDir,
+    [string[]]$ExcludePaths,
+    [switch]$IncludeAppAssets
 )
 
 $RepoRoot  = Split-Path $PSScriptRoot -Parent
@@ -33,4 +35,7 @@ if ($DataDir) {
     $Params['DataDir'] = Join-Path $RepoRoot 'data'
 }
 
-& $ScriptPath @Params @args
+if ($ExcludePaths)     { $Params['ExcludePaths']     = $ExcludePaths }
+if ($IncludeAppAssets) { $Params['IncludeAppAssets'] = $true }
+
+& $ScriptPath @Params
