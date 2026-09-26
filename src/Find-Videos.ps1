@@ -5,12 +5,37 @@
 .DESCRIPTION
     Scans specified subdirectories of each profile under C:\Users for .mp4 files.
     Outputs a VLC XSPF playlist per user to .\data\ and a combined CSV.
+
+    By default, known application assets (bundled demo clips, browser-extension
+    stubs, cached UI videos) are excluded so the results contain only real user
+    recordings. Use -IncludeAppAssets to keep everything, or -ExcludePatterns to
+    supply your own regex list.
+.PARAMETER UsersRoot
+    Root directory containing user profiles. Defaults to C:\Users.
+.PARAMETER DataDir
+    Output directory for playlists and CSV.
+.PARAMETER ExcludePaths
+    Literal path fragments matched (case-insensitively) against each full file
+    path. A file containing any fragment is excluded. Defaults to known
+    app-asset locations.
+.PARAMETER IncludeAppAssets
+    Disable filtering entirely and report every MP4 found.
 #>
 
 [CmdletBinding()]
 param(
     [string]$UsersRoot = 'C:\Users',
-    [string]$DataDir   = (Join-Path (Split-Path $PSScriptRoot -Parent) 'data')
+    [string]$DataDir   = (Join-Path (Split-Path $PSScriptRoot -Parent) 'data'),
+
+    # Known application-asset locations — none of these hold user recordings.
+    [string[]]$ExcludePaths = @(
+        '\AppData\Roaming\ManyCam\Backgrounds\',            # ManyCam bundled demo backgrounds
+        '\web-accessible-resources\',                       # browser-extension resources (noopmp4 stubs)
+        '\AppData\Roaming\Zoom\data\WaitingRoom\',          # Zoom waiting-room clips
+        '\AppData\Local\Microsoft\Office\SolutionPackages\' # Office offline package resources
+    ),
+
+    [switch]$IncludeAppAssets
 )
 
 $SubDirs = @(
@@ -22,6 +47,8 @@ $SubDirs = @(
     'Desktop'
 )
 
+$ActiveExclusions = if ($IncludeAppAssets) { @() } else { $ExcludePaths }
+
 # ---------------------------------------------------------------------------
 # Setup output directory
 # ---------------------------------------------------------------------------
@@ -29,23 +56,24 @@ if (-not (Test-Path $DataDir)) {
     New-Item -ItemType Directory -Path $DataDir | Out-Null
 }
 
-$CsvPath = Join-Path $DataDir 'all-videos.csv'
-$CsvRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+$CsvPath       = Join-Path $DataDir 'all-videos.csv'
+$CsvRows       = [System.Collections.Generic.List[PSCustomObject]]::new()
+$ExcludedTotal = 0
 
 # ---------------------------------------------------------------------------
 # Iterate profiles
 # ---------------------------------------------------------------------------
 $Profiles = Get-ChildItem -Path $UsersRoot -Directory -ErrorAction SilentlyContinue
 
-foreach ($Profile in $Profiles) {
-    $ProfileName = $Profile.Name
+foreach ($UserProfile in $Profiles) {
+    $ProfileName = $UserProfile.Name
     $Videos      = [System.Collections.Generic.List[string]]::new()
 
     # Track per-subdir counts for console output
     $SubDirCounts = [ordered]@{}
 
     foreach ($Sub in $SubDirs) {
-        $SearchPath = Join-Path $Profile.FullName $Sub
+        $SearchPath = Join-Path $UserProfile.FullName $Sub
 
         if (-not (Test-Path $SearchPath)) { continue }
 
@@ -53,9 +81,23 @@ foreach ($Profile in $Profiles) {
                                -ErrorAction SilentlyContinue -Force |
                  Select-Object -ExpandProperty FullName
 
-        if ($Found) {
-            $SubDirCounts[$Sub] = @($Found).Count
-            foreach ($F in $Found) { $Videos.Add($F) }
+        if (-not $Found) { continue }
+
+        # Drop known application assets
+        $Kept = foreach ($F in $Found) {
+            $IsAsset = $false
+            foreach ($Fragment in $ActiveExclusions) {
+                if ($F.IndexOf($Fragment, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $IsAsset = $true
+                    break
+                }
+            }
+            if ($IsAsset) { $ExcludedTotal++ } else { $F }
+        }
+
+        if ($Kept) {
+            $SubDirCounts[$Sub] = @($Kept).Count
+            foreach ($K in $Kept) { $Videos.Add($K) }
         }
     }
 
@@ -106,4 +148,8 @@ if ($CsvRows.Count -gt 0) {
     Write-Host "CSV written: $CsvPath ($($CsvRows.Count) total videos)"
 } else {
     Write-Host 'No MP4 files found across any profile.'
+}
+
+if ($ExcludedTotal -gt 0) {
+    Write-Host "Excluded $ExcludedTotal application asset file$(if ($ExcludedTotal -ne 1) { 's' }) (use -IncludeAppAssets to keep them)."
 }
